@@ -110,6 +110,15 @@ dialog h1{font-size:19px}
 .toast{position:fixed;left:50%;bottom:calc(84px + env(safe-area-inset-bottom,0px));transform:translateX(-50%);background:var(--ink);color:var(--bg);padding:9px 16px;border-radius:8px;font-weight:600;z-index:50;max-width:calc(100vw - 32px)}
 textarea.dump{width:100%;height:110px;font-family:var(--f-num);font-size:12px}
 .foot{font-size:12.5px;color:var(--muted);margin-top:8px}
+.syncbar{display:flex;justify-content:flex-end;margin:-8px 0 10px}
+.sb{all:unset;cursor:pointer;display:inline-flex;align-items:center;gap:7px;font-size:12.5px;color:var(--muted);padding:3px 10px;border-radius:99px;border:1px solid var(--line);background:var(--surface)}
+.sb:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.sb i{width:7px;height:7px;border-radius:50%;background:var(--muted);flex:none}
+.sb.ok i{background:var(--in)} .sb.warn i{background:var(--warn)} .sb.bad i{background:var(--out)} .sb.bad{color:var(--out)}
+.sb.run i{background:var(--accent)}
+@media (prefers-reduced-motion:no-preference){.sb.run i{animation:pulse 1s ease-in-out infinite alternate}}
+@keyframes pulse{from{opacity:.3}to{opacity:1}}
+.sbt.ok{color:var(--in)} .sbt.warn{color:var(--warn)} .sbt.bad{color:var(--out)}
 @media (max-width:760px){
   .shell{grid-template-columns:minmax(0,1fr)}
   nav.side{position:fixed;top:auto;bottom:0;left:0;right:0;height:auto;flex-direction:row;overflow-x:auto;gap:0;padding:6px 6px calc(6px + env(safe-area-inset-bottom,0px));border-right:0;border-top:1px solid var(--line);background:var(--surface);z-index:20}
@@ -118,6 +127,7 @@ textarea.dump{width:100%;height:110px;font-family:var(--f-num);font-size:12px}
   .grid2,.f3{grid-template-columns:minmax(0,1fr)}
   .tile .num{font-size:16px}
   .tiles{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .tiles>.tile:last-child:nth-child(odd){grid-column:1/-1}
 }
 @media (prefers-reduced-motion:no-preference){.tab,.btn,tbody tr,.li,.tile{transition:background .12s,border-color .12s}}
 </style>
@@ -136,7 +146,7 @@ textarea.dump{width:100%;height:110px;font-family:var(--f-num);font-size:12px}
     <button class="tab" data-v="stok">Stok</button>
     <button class="tab" data-v="kasa">Kasalar</button>
     <div class="navsep"></div>
-    <button class="tab" data-v="ayar">Kur ve yedek</button>
+    <button class="tab" data-v="ayar">Ayarlar</button>
   </nav>
   <main id="main"></main>
 </div>
@@ -230,7 +240,106 @@ function emptyState(){return {v:2,sample:false,rates:S?S.rates:{USD:41.5,EUR:48.
 let S=null;
 try{S=JSON.parse(localStorage.getItem(KEY)||'null')}catch(e){S=null}
 if(!S||S.v!==2)S=sample();
-function save(){try{localStorage.setItem(KEY,JSON.stringify(S))}catch(e){}}
+
+// ---------- Eşitleme (Supabase REST)
+// Her kayıt ayrı satır: id = "tür:kayıtId". Değişiklikler önce cihaza yazılır, sonra sıraya girip gönderilir.
+const SKEY='kasa-sync-v1';
+let SY={url:'',key:'',email:'',uid:'',at:'',rt:'',exp:0,last:'',dirty:{},n:0,lastOk:0,err:''};
+try{Object.assign(SY,JSON.parse(localStorage.getItem(SKEY)||'{}'))}catch(e){}
+function saveSY(){try{localStorage.setItem(SKEY,JSON.stringify(SY))}catch(e){}}
+const KINDS=['cari','stok','docs','moves'];
+function flatten(){const m={};for(const k of KINDS)for(const r of S[k])m[k+':'+r.id]=JSON.stringify(r);m['meta:rates']=JSON.stringify(S.rates);return m}
+let snap={};
+const connected=()=>!!(SY.url&&SY.key&&SY.rt);
+const pending=()=>Object.keys(SY.dirty).length;
+function save(){
+  try{localStorage.setItem(KEY,JSON.stringify(S))}catch(e){}
+  const cur=flatten();
+  if(!S.sample&&connected()){let ch=false;
+    for(const k in cur)if(snap[k]!==cur[k]){SY.dirty[k]=++SY.n;ch=true}
+    for(const k in snap)if(!(k in cur)){SY.dirty[k]=++SY.n;ch=true}
+    if(ch){saveSY();scheduleSync(1200)}}
+  snap=cur;setSyncBadge();
+}
+function persistLocal(){try{localStorage.setItem(KEY,JSON.stringify(S))}catch(e){}snap=flatten()}
+function authFetch(grant,body){
+  return fetch(SY.url+'/auth/v1/token?grant_type='+grant,{method:'POST',headers:{apikey:SY.key,'Content-Type':'application/json'},body:JSON.stringify(body)})
+  .then(async r=>{const j=await r.json().catch(()=>({}));
+    if(!r.ok){const m=j.error_description||j.msg||j.message||j.error||('Hata '+r.status);
+      if(grant==='refresh_token'){SY.rt='';SY.at='';saveSY();throw new Error('Oturum sona erdi. Ayarlar ekranından yeniden giriş yapın.')}
+      throw new Error(/invalid login|invalid_grant|credentials/i.test(m)?'E-posta ya da şifre hatalı.':m)}
+    SY.at=j.access_token;SY.rt=j.refresh_token;SY.exp=Date.now()+(j.expires_in||3600)*1000;if(j.user&&j.user.id)SY.uid=j.user.id;saveSY()});
+}
+async function api(path,opt={}){
+  if(!SY.at||Date.now()>SY.exp-60000)await authFetch('refresh_token',{refresh_token:SY.rt});
+  const go=()=>fetch(SY.url+'/rest/v1/'+path,{...opt,headers:{apikey:SY.key,Authorization:'Bearer '+SY.at,'Content-Type':'application/json',...(opt.headers||{})}});
+  let r=await go();
+  if(r.status===401){await authFetch('refresh_token',{refresh_token:SY.rt});r=await go()}
+  if(!r.ok){let t=await r.text();try{const j=JSON.parse(t);t=j.message||t}catch(e){}
+    if(/relation .*records.* does not exist|Could not find the table/i.test(t))t='Veritabanı tablosu bulunamadı. Kurulumdaki SQL adımını çalıştırın.';
+    throw new Error(t.slice(0,220)||('Hata '+r.status))}
+  return r;
+}
+function applyRow(row){
+  const i=row.id.indexOf(':'),kind=row.id.slice(0,i),id=row.id.slice(i+1);
+  if(kind==='meta'){if(id==='rates'&&!row.deleted&&row.data)S.rates=row.data;return}
+  if(!KINDS.includes(kind))return;
+  const arr=S[kind],idx=arr.findIndex(x=>x.id===id);
+  if(row.deleted){if(idx>=0)arr.splice(idx,1)}
+  else if(row.data){if(idx>=0)arr[idx]=row.data;else arr.push(row.data)}
+}
+let syncing=false,again=false,syncTimer=null,syncState='';
+function scheduleSync(ms){clearTimeout(syncTimer);syncTimer=setTimeout(syncNow,ms)}
+async function syncNow(){
+  if(!connected())return;
+  if(syncing){again=true;return}
+  syncing=true;syncState='sync';setSyncBadge();
+  try{
+    // 1) gönder
+    const taken={...SY.dirty},keys=Object.keys(taken);
+    if(keys.length){
+      const cur=flatten();
+      const rows=keys.map(k=>({user_id:SY.uid,id:k,kind:k.slice(0,k.indexOf(':')),data:k in cur?JSON.parse(cur[k]):null,deleted:!(k in cur)}));
+      for(let i=0;i<rows.length;i+=400)
+        await api('records?on_conflict=user_id,id',{method:'POST',headers:{Prefer:'resolution=merge-duplicates,return=minimal'},body:JSON.stringify(rows.slice(i,i+400))});
+      for(const k of keys)if(SY.dirty[k]===taken[k])delete SY.dirty[k];
+      saveSY();
+    }
+    // 2) al
+    let since=SY.last,changed=false,first=true;
+    for(;;){
+      let q='records?select=id,data,deleted,changed_at&order=changed_at.asc&limit=1000';
+      if(since){const t=first?new Date(new Date(since).getTime()-10000).toISOString():since;q+='&changed_at='+(first?'gte.':'gt.')+encodeURIComponent(t)}
+      const rows=await (await api(q)).json();first=false;
+      for(const row of rows){if(SY.dirty[row.id])continue;applyRow(row);changed=true}
+      if(rows.length){const lt=rows[rows.length-1].changed_at;if(!since||lt>since)since=lt}
+      if(rows.length<1000)break;
+    }
+    SY.last=since;SY.lastOk=Date.now();SY.err='';saveSY();
+    if(changed){persistLocal();if(!dlg.open&&!(document.activeElement&&document.activeElement.id==='q'))render();else needRender=true}
+    syncState='';
+  }catch(e){
+    syncState='err';SY.err=(navigator.onLine===false||/Failed to fetch|NetworkError|Load failed|network/i.test(e.message))?'offline':e.message;saveSY();
+  }finally{
+    syncing=false;setSyncBadge();
+    if(view==='ayar'&&!dlg.open&&!(document.activeElement&&/^sy-/.test(document.activeElement.id)))renderSyncPanel();
+    if(again){again=false;scheduleSync(300)}
+  }
+}
+let needRender=false;
+const hm=t=>{const d=new Date(t);return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0')};
+function syncText(){
+  if(!connected())return {cls:'off',txt:SY.url&&SY.email?'Eşitleme için giriş yapın':'Bu cihazda kayıtlı · eşitleme kapalı'};
+  const p=pending();
+  if(syncState==='sync')return {cls:'run',txt:'Eşitleniyor…'};
+  if(SY.err==='offline')return {cls:'warn',txt:'Çevrimdışı'+(p?' · '+p+' değişiklik bekliyor':' · kayıtlar cihazda')};
+  if(SY.err)return {cls:'bad',txt:'Eşitleme hatası · ayrıntı için dokunun'};
+  if(p)return {cls:'warn',txt:p+' değişiklik gönderilecek'};
+  return {cls:'ok',txt:SY.lastOk?'Eşitlendi · '+hm(SY.lastOk):'Bağlandı'};
+}
+function setSyncBadge(){const b=document.getElementById('syncBadge');if(!b)return;const s=syncText();b.className='sb '+s.cls;b.lastChild.textContent=s.txt}
+
+snap=flatten();
 save();
 
 // ---------- Hesaplar
@@ -305,13 +414,16 @@ function render(){
   document.querySelectorAll('.tab').forEach(b=>b.setAttribute('aria-current',b.dataset.v===navV));
   ({panel:vPanel,satis:vDocs,alis:vDocs,musteri:vCariList,firma:vCariList,cari:vCari,stok:vStok,kasa:vKasa,ayar:vAyar}[view]||vPanel)();
   const ms=$('msel');if(ms)ms.onchange=e=>{month=e.target.value;render()};
-  const cs=$('clearSample');if(cs)cs.onclick=()=>{S=emptyState();save();render();toast('Örnek kayıtlar silindi')};
+  const cs=$('clearSample');if(cs)cs.onclick=()=>{S=emptyState();snap={};save();render();toast('Örnek kayıtlar silindi')};
   main.querySelectorAll('[data-go]').forEach(el=>el.onclick=e=>{e.stopPropagation();go(el.dataset.go,el.dataset.p)});
   main.querySelectorAll('[data-doc]').forEach(el=>el.onclick=()=>docForm(el.dataset.doc));
   main.querySelectorAll('[data-newdoc]').forEach(el=>el.onclick=()=>docForm(null,el.dataset.newdoc,el.dataset.cari));
   main.querySelectorAll('[data-move]').forEach(el=>el.onclick=()=>moveForm(el.dataset.move));
   main.querySelectorAll('[data-newmove]').forEach(el=>el.onclick=()=>moveForm(null,el.dataset.newmove,{cariId:el.dataset.cari,kasa:el.dataset.kasa}));
   const q=$('q');if(q){q.oninput=e=>{filt.q=e.target.value;const p=q.selectionStart;render();const n=$('q');n.focus();n.setSelectionRange(p,p)}}
+  const s=syncText();
+  main.insertAdjacentHTML('afterbegin',`<div class="syncbar"><button type="button" id="syncBadge" class="sb ${s.cls}"><i aria-hidden="true"></i><span>${esc(s.txt)}</span></button></div>`);
+  $('syncBadge').onclick=()=>{if(connected()&&!SY.err&&!pending()){syncNow();return}go('ayar')};
 }
 const match=(s)=>!filt.q||s.toLocaleLowerCase('tr').includes(filt.q.toLocaleLowerCase('tr'));
 
@@ -454,8 +566,57 @@ function vKasa(){
 }
 
 // ---------- Kur ve yedek
+function renderSyncPanel(){
+  const p=$('syncPanel');if(!p)return;
+  if(connected()){
+    const s=syncText();
+    p.innerHTML=`<h2>Cihazlar arası eşitleme</h2>
+    <div class="kv" style="margin-bottom:12px"><span>Hesap</span><span>${esc(SY.email)}</span><span>Durum</span><span class="sbt ${s.cls}">${esc(s.txt)}</span><span>Son eşitleme</span><span class="num">${SY.lastOk?fmtDate(iso(new Date(SY.lastOk)))+' '+hm(SY.lastOk):'—'}</span><span>Bekleyen değişiklik</span><span class="num">${pending()}</span></div>
+    ${SY.err&&SY.err!=='offline'?`<p class="note neg" style="margin-bottom:10px">${esc(SY.err)}</p>`:''}
+    <p class="note" style="margin-bottom:10px">Bu cihazdaki kayıtlar aynı hesapla giriş yapılan diğer cihazlarla otomatik eşitlenir. İnternet yokken girdikleriniz bağlantı gelince gönderilir.</p>
+    <div class="row"><button class="btn primary" id="sy-now">Şimdi eşitle</button><button class="btn" id="sy-out">Bağlantıyı kes</button></div>`;
+    $('sy-now').onclick=()=>{SY.err='';syncNow()};
+    const o=$('sy-out');let armed=false;o.onclick=()=>{if(!armed){armed=true;o.textContent=pending()?'Gönderilmemiş '+pending()+' değişiklik var, yine de kes':'Bağlantıyı kesmeyi onayla';return}
+      SY.at='';SY.rt='';SY.last='';SY.dirty={};SY.err='';SY.lastOk=0;saveSY();render();toast('Bağlantı kesildi. Kayıtlar bu cihazda duruyor.')};
+    return;
+  }
+  p.innerHTML=`<h2>Cihazlar arası eşitleme</h2>
+  <p class="note" style="margin-bottom:12px">Telefon ve bilgisayarın aynı kayıtları görmesi için Supabase hesabınızın bilgilerini girin. Her cihazda bir kez yapılır.</p>
+  <div class="f2"><label class="fld"><span>Project URL</span><input id="sy-url" value="${esc(SY.url)}" placeholder="https://xxxx.supabase.co" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
+  <label class="fld"><span>Publishable key</span><input id="sy-key" value="${esc(SY.key)}" placeholder="sb_publishable_…" autocomplete="off" autocapitalize="off" spellcheck="false"></label></div>
+  <div class="f2" style="margin-top:12px"><label class="fld"><span>E-posta</span><input id="sy-mail" type="email" value="${esc(SY.email)}" autocomplete="username" autocapitalize="off"></label>
+  <label class="fld"><span>Şifre</span><input id="sy-pass" type="password" autocomplete="current-password"></label></div>
+  ${S.sample?'<p class="note warn" style="margin-top:10px">Bağlanınca bu cihazdaki örnek kayıtlar silinir ve hesabınızdaki kayıtlar yüklenir.</p>':(S.docs.length||S.cari.length||S.moves.length?'<p class="note" style="margin-top:10px">Bu cihazdaki mevcut kayıtlar hesabınıza gönderilip diğer cihazlardakilerle birleştirilir.</p>':'')}
+  <p id="sy-err" class="note neg" hidden style="margin-top:10px"></p>
+  <div class="row" style="margin-top:12px"><button class="btn primary" id="sy-in">Bağlan</button></div>`;
+  $('sy-in').onclick=async()=>{
+    const e=$('sy-err'),b=$('sy-in');e.hidden=true;
+    let url=$('sy-url').value.trim().replace(/\/+$/,'').replace(/\/(rest|auth)\/v1.*$/,'');
+    if(url&&!/^https?:\/\//.test(url))url='https://'+url;
+    const key=$('sy-key').value.trim(),mail=$('sy-mail').value.trim(),pass=$('sy-pass').value;
+    if(!url||!key||!mail||!pass){e.textContent='Dört alanı da doldurun.';e.hidden=false;return}
+    b.disabled=true;b.textContent='Bağlanıyor…';
+    SY.url=url;SY.key=key;SY.email=mail;SY.last='';SY.dirty={};SY.err='';SY.lastOk=0;
+    try{
+      await authFetch('password',{email:mail,password:pass});
+      await api('records?select=id&limit=1'); // tablo var mı
+      if(S.sample){S=emptyState();persistLocal()}
+      else{const cur=flatten();for(const k in cur)SY.dirty[k]=++SY.n}
+      snap=flatten();saveSY();
+      await syncNow();
+      if(SY.err&&SY.err!=='offline')throw new Error(SY.err);
+      render();toast('Bağlandı. Kayıtlar eşitlendi.');
+    }catch(err){
+      Object.assign(SY,{url,key,email:mail,at:'',rt:'',dirty:{},err:'',last:'',lastOk:0});saveSY();syncState='';
+      renderSyncPanel();setSyncBadge();
+      const e2=$('sy-err');if(e2){e2.textContent=/Failed to fetch|NetworkError|Load failed/i.test(err.message)?'Sunucuya ulaşılamadı. İnternet bağlantısını ve Project URL\'yi kontrol edin.':err.message;e2.hidden=false}
+    }
+  };
+}
+
 function vAyar(){
-  main.innerHTML=`<header class="top"><h1>Kur ve yedek</h1></header>
+  main.innerHTML=`<header class="top"><h1>Ayarlar</h1></header>
+  <section class="panel" id="syncPanel" style="margin-bottom:22px"></section>
   <div class="grid2">
   <section class="panel"><h2>Döviz kurları</h2>
     <p class="note" style="margin-bottom:10px">Toplam nakdin TL karşılığında ve farklı dövizde tahsilat yaparken öneri olarak kullanılır.${S.rates.date?' Son güncelleme: '+fmtDate(S.rates.date)+'.':''}</p>
@@ -463,7 +624,7 @@ function vAyar(){
     <div class="row" style="margin-top:10px"><button class="btn primary" id="saveRates">Kurları kaydet</button><button class="btn" id="fetchRates">İnternetten güncelle</button></div>
   </section>
   <section class="panel"><h2>Yedek al</h2>
-    <p class="note" style="margin-bottom:10px">Kayıtlar yalnızca bu cihazda saklanır. Telefonla bilgisayar arasında taşımak ya da güvence için düzenli yedek alın.</p>
+    <p class="note" style="margin-bottom:10px">Eşitleme açık olsa da ara sıra yedek almanız iyi olur. Yedek dosyası bütün kayıtları içerir.</p>
     <div class="row"><button class="btn primary" id="dl">Yedek dosyası indir</button><button class="btn" id="cp">Panoya kopyala</button></div>
     <div class="row" style="margin-top:10px"><button class="btn small" id="csvS">Satışlar CSV</button><button class="btn small" id="csvK">Kasa hareketleri CSV</button><button class="btn small" id="csvT">Stok CSV</button></div>
     <textarea class="dump" id="dump" readonly hidden aria-label="Yedek metni" style="margin-top:10px"></textarea>
@@ -476,7 +637,7 @@ function vAyar(){
     <div class="row" style="margin-top:8px"><button class="btn" id="restore">Metinden geri yükle</button></div>
   </section>
   <section class="panel"><h2>Tüm verileri sil</h2>
-    <p class="note" style="margin-bottom:10px">Cariler, stok kartları, belgeler ve kasa hareketleri silinir. Önce yedek alın.</p>
+    <p class="note" style="margin-bottom:10px">Cariler, stok kartları, belgeler ve kasa hareketleri silinir. Eşitleme açıksa diğer cihazlardan da silinir. Önce yedek alın.</p>
     <div class="row"><button class="btn danger" id="wipe">Tüm kayıtları sil</button></div>
   </section></div>`;
   $('saveRates').onclick=()=>{const u=parseAmount($('rUSD').value),e=parseAmount($('rEUR').value);if(!(u>0&&e>0)){toast('Kurları sayı olarak girin, örneğin 41,50');return}S.rates={USD:u,EUR:e,date:today()};save();toast('Kurlar kaydedildi')};
@@ -499,6 +660,7 @@ function vAyar(){
   $('restore').onclick=()=>load($('paste').value);
   const w=$('wipe');let armed=false;
   w.onclick=()=>{if(!armed){armed=true;w.textContent='Evet, geri dönüşü yok, sil';return}S=emptyState();save();go('panel');toast('Tüm kayıtlar silindi')};
+  renderSyncPanel();
 }
 
 // ---------- Formlar ortak
@@ -635,7 +797,7 @@ function docForm(id,type,cariId){
     if(!lines.length)return err('En az bir ürün ekleyin.');
     for(const l of lines){if(!l.stokId)return err('Her satırda ürün seçin.');if(!(+l.qty>0))return err('Miktar sıfırdan büyük olmalı.');if(!(+l.price>=0)||l.price==='')return err('Her satır için birim fiyat girin.')}
     d.lines=lines.map(l=>({stokId:l.stokId,qty:+l.qty,price:+l.price}));
-    if(isNew){S.seq[type]=(S.seq[type]||0)+1;d.no=(isS?'S-':'A-')+String(S.seq[type]).padStart(4,'0');S.docs.push(d);
+    if(isNew){const pre=isS?'S-':'A-';const max=S.docs.filter(x=>x.type===type).reduce((a,x)=>Math.max(a,parseInt(String(x.no).replace(/\D/g,''),10)||0),0);d.no=pre+String(max+1).padStart(4,'0');S.docs.push(d);
       if(pay&&pay.checked){const a=parseAmount($('d-payamt').value);if(a>0)S.moves.push({id:uid(),type:isS?'tahsilat':'odeme',date:d.date,kasa:$('d-kasa').value,amount:a,cariId:d.cariId,ccur:d.cur,rate:1,desc:d.no+' peşin'})}}
     else{const i=S.docs.findIndex(x=>x.id===d.id);S.docs[i]=d}
     done(isNew?(isS?'Satış kaydedildi · ':'Alış kaydedildi · ')+d.no:'Değişiklik kaydedildi');
@@ -710,8 +872,13 @@ function moveForm(id,type,preset){
 
 document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{month='';go(b.dataset.v)});
 dlg.addEventListener('click',e=>{if(e.target===dlg)dlg.close()});
-window.__kasa={get S(){return S},set S(v){S=v},cariBal,kasaBal,stokQty,remainingMap,docTotal,moveC,parseAmount,sample};
+dlg.addEventListener('close',()=>{if(needRender){needRender=false;render()}});
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')scheduleSync(200)});
+window.addEventListener('online',()=>scheduleSync(200));
+setInterval(()=>{if(document.visibilityState==='visible'&&!syncing)syncNow()},30000);
+window.__kasa={get S(){return S},set S(v){S=v},get SY(){return SY},cariBal,kasaBal,stokQty,remainingMap,docTotal,moveC,parseAmount,sample,syncNow,save};
 render();
+scheduleSync(300);
 })();
 </script>
 
